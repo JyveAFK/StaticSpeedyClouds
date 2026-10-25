@@ -1,0 +1,194 @@
+// Composite body shared by the normal and MSAA variants.
+//
+// Three cases per pixel (per MSAA sample), based on where that pixel's own surface is relative to the cloud slab:
+//   1. Surface is in front of the slab, or the ray never meets it  -> no cloud / use the low-res taps.
+//   2. Surface is INSIDE the slab's range (a mesh, ship or hill in the cloud) -> an exact full-resolution
+//      march from the camera to that surface, so occlusion does not depend on the half-res buffer.
+//   3. Surface is beyond the slab (ground below, sky)               -> upsample the low-res cloud (hard edge applied).
+//
+// NOTE: cloud_common.comp must be #included by the .glsl file before this one
+// (Godot does not resolve #include inside an included file).
+
+#ifndef MSAA_ENABLED
+	#define MSAA_ENABLED 0
+#endif
+
+#if (!MSAA_ENABLED)
+	#define Sampler2DMSAA                              sampler2D
+	#define Image2DMSAA                                image2D
+	#define textureSamplesMSAA(sampler_)               (1)
+	#define texelFetchMSAA(sampler_, P_, sample_)      texelFetch(sampler_, P_, 0)
+	#define imageLoadMSAA(image_, P_, sample_)         imageLoad(image_, P_)
+	#define imageStoreMSAA(image_, P_, sample_, data_) imageStore(image_, P_, data_)
+#else
+	#define Sampler2DMSAA                              sampler2DMS
+	#define Image2DMSAA                                image2DMS
+	#define textureSamplesMSAA(sampler_)               textureSamples(sampler_)
+	#define texelFetchMSAA(sampler_, P_, sample_)      texelFetch(sampler_, P_, sample_)
+	#define imageLoadMSAA(image_, P_, sample_)         imageLoad(image_, P_, sample_)
+	#define imageStoreMSAA(image_, P_, sample_, data_) imageStore(image_, P_, sample_, data_)
+#endif
+
+layout(rgba16f, set = 0, binding = 1) uniform restrict Image2DMSAA color_image;
+layout(set = 0, binding = 2) uniform sampler2D low_cloud;
+layout(set = 0, binding = 3) uniform sampler2D low_data;   // x scene dist, y front, z back, w clipped
+layout(set = 0, binding = 4) uniform Sampler2DMSAA scene_depth;
+layout(set = 0, binding = 6) uniform sampler3D detail_tex;
+
+float ign(vec2 p) {
+	return fract(52.9829189 * fract(dot(p, vec2(0.06711056, 0.00583715))));
+}
+
+float sample_density(vec3 world_pos, float t) {
+	GridHit g = grid_tex(world_pos);
+	if (!g.ok || g.h < 0.0 || g.h > 1.0) {
+		return 0.0;
+	}
+	float d = apply_effectors(world_pos, grid_density(g));
+	if (d > 0.0 && u.detail.y > 0.0) {
+		float fade = 1.0 - smoothstep(u.detail.z, u.detail.w, t);
+		if (fade > 0.0) {
+			float n = textureLod(detail_tex, (world_pos + u.detail_off.xyz) / u.detail.x, 0.0).r;
+			float erode = (1.0 - n) * u.detail.y * fade;
+			d = clamp((d - erode) / max(1.0 - erode, 0.001), 0.0, 1.0);
+		}
+	}
+	return d * distance_fade(t);
+}
+
+// Exact opacity of the cloud between distances t0 and t1 along the ray.
+float exact_alpha(vec3 ro, vec3 rd, float t0, float t1, float jitter) {
+	float range = t1 - t0;
+	int steps = clamp(int(range / 40.0), 12, 64);
+	float step_len = range / float(steps);
+	float od = 0.0;
+	for (int i = 0; i < steps; i++) {
+		float t = t0 + (float(i) + jitter) * step_len;
+		od += sample_density(ro + rd * t, t) * step_len;
+	}
+	return 1.0 - exp(-od * u.vol_extent.w);
+}
+
+void main() {
+	ivec2 id = ivec2(gl_GlobalInvocationID.xy);
+	ivec2 full_size = ivec2(u.misc.xy);
+	if (any(greaterThanEqual(id, full_size))) {
+		return;
+	}
+	vec2 uv = (vec2(id) + 0.5) / u.misc.xy;
+	int debug_mode = int(u.misc.z + 0.5);
+
+	vec3 ro = u.cam_to_world[3].xyz;
+	vec3 rd = view_dir_world(uv);
+
+	// Where this pixel's ray crosses the cloud slab.
+	float y0 = u.vol_origin.y;
+	float y1 = y0 + u.vol_extent.y;
+	float slab_t0 = 0.0;
+	float slab_t1 = u.march.w;
+	bool slab_hit = true;
+	if (abs(rd.y) < 1e-5) {
+		slab_hit = ro.y >= y0 && ro.y <= y1;
+	} else {
+		float ta = (y0 - ro.y) / rd.y;
+		float tb = (y1 - ro.y) / rd.y;
+		slab_t0 = max(0.0, min(ta, tb));
+		slab_t1 = min(slab_t1, max(ta, tb));
+		slab_hit = slab_t1 > slab_t0;
+	}
+
+	// The four low-res taps are the same for every MSAA sample of this pixel.
+	ivec2 low_size = ivec2(u.view.xy);
+	vec2 lp = uv * u.view.xy - 0.5;
+	ivec2 base = ivec2(floor(lp));
+	vec2 f = lp - vec2(base);
+	vec4 tap_cloud[4];
+	vec4 tap_data[4];
+	float tap_bw[4];
+	vec3 tint_rgb = vec3(0.0);
+	float tint_a = 0.0;
+	for (int j = 0; j < 2; j++) {
+		for (int i = 0; i < 2; i++) {
+			int k = j * 2 + i;
+			ivec2 tap = clamp(base + ivec2(i, j), ivec2(0), low_size - ivec2(1));
+			tap_cloud[k] = texelFetch(low_cloud, tap, 0);
+			tap_data[k] = texelFetch(low_data, tap, 0);
+			tap_bw[k] = (i == 0 ? 1.0 - f.x : f.x) * (j == 0 ? 1.0 - f.y : f.y);
+			tint_rgb += tap_cloud[k].rgb * tap_bw[k];
+			tint_a += clamp(tap_cloud[k].a, 0.0, 1.0) * tap_bw[k];
+		}
+	}
+	// Average cloud colour per unit alpha, used to shade the exact-alpha case.
+	vec3 fallback_tint = u.sun_color.rgb * 0.3 + mix(u.ground_ambient.rgb, u.sky_ambient.rgb, 0.5);
+	vec3 cloud_tint = tint_a > 0.02 ? tint_rgb / tint_a : fallback_tint;
+
+	float jitter = ign(vec2(id));
+
+	int samples = textureSamplesMSAA(scene_depth);
+	for (int s = 0; s < samples; s++) {
+		float sd = scene_distance(uv, texelFetchMSAA(scene_depth, id, s).r);
+		vec4 scene = imageLoadMSAA(color_image, id, s);
+
+		if (debug_mode == 2) {
+			// Reconstructed scene distance (white = 5 km or more / sky).
+			imageStoreMSAA(color_image, id, s, vec4(vec3(clamp(sd / 5000.0, 0.0, 1.0)), 1.0));
+			continue;
+		}
+
+		float ha = 0.0;
+		vec3 cloud_rgb = vec3(0.0);
+		bool geom_in_slab = slab_hit && sd < slab_t1;
+
+		if (geom_in_slab) {
+			// Case 1/2: this surface lies inside the cloud's range.
+			if (sd > slab_t0) {
+				ha = exact_alpha(ro, rd, slab_t0, sd, jitter);
+				cloud_rgb = cloud_tint * ha;
+			}
+			// else: surface is in front of the cloud, no cloud over it.
+		} else {
+			// Case 3: surface is beyond the slab (or sky): upsample the low-res cloud.
+			vec3 sum_rgb = vec3(0.0);
+			float sum_a = 0.0;
+			float wsum = 0.0;
+			for (int k = 0; k < 4; k++) {
+				vec4 cl = tap_cloud[k];
+				vec4 dat = tap_data[k];
+				bool clipped = dat.w > 0.5;
+				// A tap whose ray was cut short by nearer geometry knows nothing about the cloud
+				// beyond that geometry, so do not use it for a surface that is further away.
+				bool valid = !clipped || dat.x >= sd * 0.98;
+				float w = (tap_bw[k] + 0.001) * (valid ? 1.0 : 0.001);
+				sum_rgb += cl.rgb * w;
+				sum_a += clamp(cl.a, 0.0, 1.0) * w;
+				wsum += w;
+			}
+			float inv = 1.0 / max(wsum, 1e-12);
+			float a = clamp(sum_a * inv, 0.0, 1.0);
+			vec3 rgb = sum_rgb * inv;
+			ha = a;
+			if (u.post.y > u.post.x) {
+				ha = smoothstep(u.post.x, u.post.y, a);
+			}
+			cloud_rgb = rgb * (ha / max(a, 1e-4));
+		}
+
+		if (debug_mode == 1) {
+			imageStoreMSAA(color_image, id, s, vec4(vec3(ha), 1.0));
+			continue;
+		}
+		if (debug_mode == 3) {
+			imageStoreMSAA(color_image, id, s, vec4(cloud_rgb, 1.0));
+			continue;
+		}
+		if (debug_mode == 4) {
+			// R = cloud alpha over this surface, G = surface lies inside the cloud slab's range,
+			// B = surface is in front of the cloud.
+			imageStoreMSAA(color_image, id, s, vec4(ha, geom_in_slab ? 1.0 : 0.0, (geom_in_slab && sd <= slab_t0) ? 1.0 : 0.0, 1.0));
+			continue;
+		}
+
+		scene.rgb = scene.rgb * (1.0 - ha) + cloud_rgb;
+		imageStoreMSAA(color_image, id, s, scene);
+	}
+}

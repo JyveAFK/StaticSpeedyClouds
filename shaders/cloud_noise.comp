@@ -1,0 +1,91 @@
+// Tileable noise helpers shared by the bake shaders.
+// "period" is the number of lattice cells before the pattern repeats, so every
+// texture produced from these functions tiles seamlessly in X and Y.
+
+uvec3 pcg3d(uvec3 v) {
+	v = v * 1664525u + 1013904223u;
+	v.x += v.y * v.z;
+	v.y += v.z * v.x;
+	v.z += v.x * v.y;
+	v ^= v >> 16u;
+	v.x += v.y * v.z;
+	v.y += v.z * v.x;
+	v.z += v.x * v.y;
+	return v;
+}
+
+vec3 hash33(ivec3 c, ivec3 period, uint seed) {
+	ivec3 w = ((c % period) + period) % period;
+	uvec3 h = pcg3d(uvec3(w) + seed * uvec3(1013u, 2749u, 3571u));
+	return vec3(h) * (1.0 / 4294967295.0);
+}
+
+float gradient_noise(vec3 p, ivec3 period, uint seed) {
+	ivec3 i = ivec3(floor(p));
+	vec3 f = fract(p);
+	vec3 w = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
+	float v[8];
+	for (int k = 0; k < 8; k++) {
+		ivec3 o = ivec3(k & 1, (k >> 1) & 1, (k >> 2) & 1);
+		vec3 g = hash33(i + o, period, seed) * 2.0 - 1.0;
+		g = normalize(g + vec3(1e-5));
+		v[k] = dot(g, f - vec3(o));
+	}
+	float x00 = mix(v[0], v[1], w.x);
+	float x10 = mix(v[2], v[3], w.x);
+	float x01 = mix(v[4], v[5], w.x);
+	float x11 = mix(v[6], v[7], w.x);
+	float r = mix(mix(x00, x10, w.y), mix(x01, x11, w.y), w.z);
+	return clamp(0.5 + r * 0.9, 0.0, 1.0);
+}
+
+float worley_noise(vec3 p, ivec3 period, uint seed) {
+	ivec3 i = ivec3(floor(p));
+	vec3 f = fract(p);
+	float md = 1e9;
+	for (int z = -1; z <= 1; z++) {
+		for (int y = -1; y <= 1; y++) {
+			for (int x = -1; x <= 1; x++) {
+				ivec3 o = ivec3(x, y, z);
+				vec3 pt = vec3(o) + hash33(i + o, period, seed);
+				md = min(md, length(pt - f));
+			}
+		}
+	}
+	return clamp(1.0 - md, 0.0, 1.0);
+}
+
+// Z never wraps in practice (height is not tiled), so give it a huge period.
+const int Z_PERIOD = 4096;
+
+float fbm_gradient(vec3 p, int period, int octaves, uint seed) {
+	float amp = 0.5;
+	float sum = 0.0;
+	float norm = 0.0;
+	for (int o = 0; o < octaves; o++) {
+		sum += amp * gradient_noise(p, ivec3(period, period, Z_PERIOD), seed + uint(o));
+		norm += amp;
+		amp *= 0.5;
+		p *= 2.0;
+		period *= 2;
+	}
+	return sum / norm;
+}
+
+float fbm_worley(vec3 p, int period, int octaves, uint seed) {
+	float amp = 0.5;
+	float sum = 0.0;
+	float norm = 0.0;
+	for (int o = 0; o < octaves; o++) {
+		sum += amp * worley_noise(p, ivec3(period, period, Z_PERIOD), seed + uint(o) * 7u);
+		norm += amp;
+		amp *= 0.5;
+		p *= 2.0;
+		period *= 2;
+	}
+	return sum / norm;
+}
+
+float remap(float v, float a, float b, float c, float d) {
+	return c + (v - a) * (d - c) / (b - a);
+}

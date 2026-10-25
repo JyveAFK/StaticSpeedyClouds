@@ -1,0 +1,205 @@
+// Shared by the march and composite passes.
+
+layout(set = 0, binding = 0, std140) uniform CloudParams {
+	mat4 inv_proj;       // inverse of the camera projection (OpenGL convention, as returned by RenderSceneData.get_cam_projection())
+	mat4 cam_to_world;   // camera transform
+	vec4 sun_dir;        // xyz = direction TOWARD the sun
+	vec4 sun_color;      // rgb already multiplied by intensity
+	vec4 sky_ambient;
+	vec4 ground_ambient;
+	vec4 fog_color;      // rgb = distance colour, a = density per metre
+	vec4 vol_origin;     // xyz = world position of the tile's minimum corner (y = cloud base altitude)
+	vec4 vol_extent;     // x = tile X (m), y = thickness (m), z = tile Z (m), w = extinction (per metre)
+	vec4 detail;         // x = detail tile size (m), y = strength, z = fade start (m), w = fade end (m)
+	vec4 march;          // x = max steps, y = near step (m), z = step growth per metre, w = max distance (m)
+	vec4 view;           // xy = low-res size, z = frame index, w = depth source (0 = engine scene UBO, 1 = own projection reverse-Z, 2 = own projection standard)
+	vec4 look;           // x = forward g, y = back g, z = back lobe weight, w = powder strength
+	vec4 misc;           // xy = full-res size, z = debug mode, w = jitter strength
+	vec4 post;           // x = hard-edge low, y = hard-edge high, z = tan(half fov) horizontal, w = tan(half fov) vertical
+	vec4 march2;         // x = max step length while inside cloud (m), y = fade start (m), z = scatter contribution (b), w = scatter eccentricity (c)
+	vec4 counts;         // x = effector count, y = light count, z = scatter octaves (0 = legacy), w = scatter attenuation (a)
+	vec4 effector_a[16]; // xyz = centre (world), w = radius (m)
+	vec4 effector_b[16]; // x = add density, y = clear amount, z = inner (full-strength) fraction of the radius
+	vec4 light_pos[6];   // xyz = position (world), w = range (m)
+	vec4 light_col[6];   // rgb = colour * energy, a = core radius (m)
+	vec4 detail_off;     // xyz = floating-origin offset wrapped to the detail tile (m)
+	vec4 grid_a;         // xy = local-space (x,z) of the loaded block's minimum corner, z = cell size (m), w = cells per side (N)
+	vec4 lvl_d[4];       // per ring level, density atlas: x = texels per slot incl. gutter, y = texels per cell, zw = 1 / atlas size (u, v)
+	vec4 lvl_l[4];       // the same for the light atlas
+	vec4 cell_a[49];     // per cell (row * N + column), shown version: x = level, yz = slot (column, row), w = 1 if drawable
+	vec4 cell_b[49];     // version fading in: x = level, yz = slot, w = fade weight (0 = none)
+	vec4 cell_c[49];     // version used when baking light (newest density): x = level, yz = slot, w = 1 if it has density
+} u;
+
+const float PI = 3.14159265;
+const int MAX_EFFECTORS = 16;
+const int MAX_LIGHTS = 6;
+const int MAX_CELLS = 49;
+const float FAR_DIST = 1e9;
+
+// One density atlas per ring level (level 0 = the camera's own cell, full detail; higher = coarser).
+// Each cell owns a slot in the atlas of its level, with a one-texel border (gutter) holding its neighbours'
+// values, so linear filtering never bleeds in data from an unrelated slot.
+layout(set = 0, binding = 8) uniform sampler3D density_l0;
+layout(set = 0, binding = 9) uniform sampler3D density_l1;
+layout(set = 0, binding = 10) uniform sampler3D density_l2;
+layout(set = 0, binding = 11) uniform sampler3D density_l3;
+
+float density_lv(int lv, vec3 uvw) {
+	if (lv == 0) {
+		return textureLod(density_l0, uvw, 0.0).r;
+	}
+	if (lv == 1) {
+		return textureLod(density_l1, uvw, 0.0).r;
+	}
+	if (lv == 2) {
+		return textureLod(density_l2, uvw, 0.0).r;
+	}
+	return textureLod(density_l3, uvw, 0.0).r;
+}
+
+// Texture coordinate inside a slot: slot = (column, row), f = position inside the cell (0..1), h = height (0..1).
+vec3 atlas_uvw(vec4 lv, vec2 slot, vec2 f, float h) {
+	return vec3((slot * lv.x + 1.0 + f * lv.y) * lv.zw, h);
+}
+
+struct GridHit {
+	vec4 d_a;   // xyz = density uvw in the shown version, w = its level
+	vec4 l_a;   // the same for the light atlas
+	vec4 d_b;   // version fading in (only used when w > 0)
+	vec4 l_b;
+	float w;    // fade weight of version b
+	float h;    // height through the slab, 0..1
+	bool ok;    // false outside the loaded block or in a cell that is not ready: there the sky is simply empty
+};
+
+// Where a world position sits in the streamed cloud grid.
+GridHit grid_tex(vec3 world_pos) {
+	GridHit r;
+	r.d_a = vec4(0.0);
+	r.l_a = vec4(0.0);
+	r.d_b = vec4(0.0);
+	r.l_b = vec4(0.0);
+	r.w = 0.0;
+	r.h = 0.0;
+	r.ok = false;
+	float n = u.grid_a.w;
+	vec2 g = (world_pos.xz - u.grid_a.xy) / u.grid_a.z;
+	if (g.x < 0.0 || g.y < 0.0 || g.x >= n || g.y >= n) {
+		return r;
+	}
+	ivec2 c = ivec2(floor(g));
+	int idx = c.y * int(n) + c.x;
+	vec4 a = u.cell_a[idx];
+	if (a.w < 0.5) {
+		return r;
+	}
+	vec2 f = g - vec2(c);
+	float h = (world_pos.y - u.vol_origin.y) / u.vol_extent.y;
+	r.h = h;
+	int la = int(a.x + 0.5);
+	r.d_a = vec4(atlas_uvw(u.lvl_d[la], a.yz, f, h), a.x);
+	r.l_a = vec4(atlas_uvw(u.lvl_l[la], a.yz, f, h), a.x);
+	vec4 b = u.cell_b[idx];
+	if (b.w > 0.0) {
+		int lb = int(b.x + 0.5);
+		r.d_b = vec4(atlas_uvw(u.lvl_d[lb], b.yz, f, h), b.x);
+		r.l_b = vec4(atlas_uvw(u.lvl_l[lb], b.yz, f, h), b.x);
+		r.w = b.w;
+	}
+	r.ok = true;
+	return r;
+}
+
+// Raw baked density at a grid hit (cross-fading between two versions of the cell while one is being swapped in).
+float grid_density(GridHit g) {
+	float d = density_lv(int(g.d_a.w + 0.5), g.d_a.xyz);
+	if (g.w > 0.0) {
+		d = mix(d, density_lv(int(g.d_b.w + 0.5), g.d_b.xyz), g.w);
+	}
+	return d;
+}
+
+// Clouds thin out smoothly between the fade start (march2.y) and max distance (march.w), so they never
+// end in a hard edge: they melt into the distance fog instead.
+float distance_fade(float t) {
+	return 1.0 - smoothstep(u.march2.y, u.march.w, t);
+}
+
+// Local density modifiers. Each effector is a sphere: inside it density is scaled down by "clear" and
+// raised by "add", with a smooth falloff from the inner fraction of the radius out to the radius.
+float apply_effectors(vec3 pos, float d) {
+	int n = int(u.counts.x);
+	for (int i = 0; i < n; i++) {
+		vec4 a = u.effector_a[i];
+		vec4 b = u.effector_b[i];
+		float dist = length(pos - a.xyz);
+		float f = 1.0 - smoothstep(a.w * b.z, a.w, dist);
+		d = d * (1.0 - b.y * f) + b.x * f;
+	}
+	return clamp(d, 0.0, 1.0);
+}
+
+// Largest safe empty-space step near cloud-creating effectors, so a small puff is not stepped over.
+float effector_step_cap(vec3 pos, float big) {
+	float cap = big;
+	int n = int(u.counts.x);
+	for (int i = 0; i < n; i++) {
+		vec4 a = u.effector_a[i];
+		if (u.effector_b[i].x > 0.0 && length(pos - a.xyz) - a.w < big) {
+			cap = min(cap, max(a.w * 0.35, 15.0));
+		}
+	}
+	return cap;
+}
+
+vec2 uv_to_ndc(vec2 uv) {
+	// uv has its origin at the top-left. get_cam_projection() already matches this orientation
+	// (no extra y flip), so a plain remap to -1..1 is correct.
+	return uv * 2.0 - 1.0;
+}
+
+// View ray in world space, built straight from the field of view and the camera transform.
+// No dependence on the projection matrix's handedness / y-flip / z convention.
+// Camera space: +X right, +Y up, -Z forward (Godot). uv origin is the top-left of the screen.
+vec3 view_dir_world(vec2 uv) {
+	vec3 dv = normalize(vec3((uv.x * 2.0 - 1.0) * u.post.z, (1.0 - uv.y * 2.0) * u.post.w, -1.0));
+	return normalize(mat3(u.cam_to_world) * dv);
+}
+
+#ifndef CLOUD_NO_SCENE
+// Godot's own scene-data uniform buffer (RenderSceneData.get_uniform_buffer()). Only the first two
+// matrices are declared; they are the corrected projection (reverse-Z, 0..1 depth) and its inverse.
+layout(set = 0, binding = 7, std140) uniform SceneBlock {
+	mat4 projection;
+	mat4 inv_projection;
+} scene;
+
+// Distance from the camera to the opaque surface at this pixel (FAR_DIST for sky).
+float scene_distance(vec2 uv, float raw_depth) {
+	int mode = int(u.view.w + 0.5);
+	vec2 ndc = uv * 2.0 - 1.0;
+	if (mode == 0) {
+		// Same reconstruction Godot's own shaders use: raw depth goes straight into clip z.
+		if (raw_depth <= 0.0) {
+			return FAR_DIST;
+		}
+		vec4 p = scene.inv_projection * vec4(ndc, raw_depth, 1.0);
+		return length(p.xyz / p.w);
+	}
+	float z_ndc;
+	if (mode == 1) {
+		if (raw_depth <= 0.0) {
+			return FAR_DIST;
+		}
+		z_ndc = 1.0 - 2.0 * raw_depth;
+	} else {
+		if (raw_depth >= 1.0) {
+			return FAR_DIST;
+		}
+		z_ndc = raw_depth * 2.0 - 1.0;
+	}
+	vec4 p = u.inv_proj * vec4(ndc, z_ndc, 1.0);
+	return length(p.xyz / p.w);
+}
+#endif
