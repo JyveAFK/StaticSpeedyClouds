@@ -314,3 +314,9 @@ Alpha Hash (or Disabled) for anything that should sit inside clouds.
 - **Cell changes:** a parameter change (coverage, seed...) re-bakes every cell in the background, nearest first, so
   it takes a few seconds to reach the edge of a 7x7 block.
 - Only the first view is handled (no XR / multiview).
+
+
+## AI disclosure 
+
+- significant assistance from Claude and Gemini, throwing shaders between both of them.
+  
