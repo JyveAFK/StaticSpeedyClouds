@@ -93,6 +93,17 @@ static var active: StaticCloudEffect
 ## Keep a low-res CPU copy of the grid for gameplay queries (StaticCloudProbe).
 @export var cpu_readback := true
 
+@export_group("Streaming Camera")
+## Every camera that renders this world runs the effect (instrument / HUD / mirror / minimap views, a second
+## player...). Only the stream camera moves the loaded block; the others still draw clouds but never pull the
+## block toward themselves. Without this, two cameras far apart fight over the block, so cells never finish:
+## edges of the cloud field, low-resolution clouds and a falling frame rate. A rendering camera counts as the
+## stream camera when it is within this distance (m) of it (allows for physics interpolation).
+@export var stream_match_distance := 2000.0
+## In the editor, keep redrawing the 3D view while cells are still being generated, so the clouds finish even
+## when the view is not moving (otherwise the editor only redraws when something changes).
+@export var editor_finish_generation := true
+
 @export_group("Sun Re-bake")
 ## Re-light the clouds gradually when sun_direction changes: a few light slices per frame, sun term only,
 ## so moving the sun never causes a frame hitch. Off = re-light every loaded cell as fast as possible
@@ -121,7 +132,7 @@ static var active: StaticCloudEffect
 
 @export_group("Heights")
 ## Noise cells per cell for the cloud-top height channel. More = busier tops.
-@export var height_cells := 6: set = _set_height_cells
+@export var height_cells := 2: set = _set_height_cells
 ## Middle of the height range: 0 = tops mostly low, 1 = mostly high.
 @export_range(0.0, 1.0) var height_bias := 0.5: set = _set_height_bias
 ## How far tops range around that middle. 0 = all the same height, 1 = from very low to very high.
@@ -198,15 +209,15 @@ static var active: StaticCloudEffect
 
 @export_group("Denoise")
 ## Edge-aware blur passes on the low-res cloud buffer (0 = off). Removes dither / moire patterns.
-@export_range(0, 3) var denoise_passes := 2
+@export_range(0, 3) var denoise_passes := 1
 ## Higher = blur respects cloud/object edges more strictly.
 @export var denoise_sharpness := 8.0
 
 @export_group("Detail")
 @export var detail_tile_size := 600.0
-@export_range(0.0, 1.0) var detail_strength := 0.35
+@export_range(0.0, 1.0) var detail_strength := 0.5
 @export var detail_fade_start := 1500.0
-@export var detail_fade_end := 4000.0
+@export var detail_fade_end := 3000.0
 
 @export_group("Edge")
 ## Alpha below edge_low is cut, above edge_high is opaque. Set both equal to disable.
@@ -230,6 +241,15 @@ var _gpu_ready := false
 var _regen_all := true          # regenerate every cell of the loaded block (parameters changed)
 var _reset_grid := true         # forget the loaded block entirely (cell size changed)
 var _light_dirty := true
+# Streaming camera: published on the main thread every frame, read on the render thread.
+## The camera the streamed block follows. null = the active camera of the main window (in the editor: the
+## first 3D editor view). Set it with set_stream_camera() if your main camera renders inside a SubViewport.
+var stream_camera: Camera3D
+var _stream_known := false
+var _stream_pos := Vector3.ZERO
+var _stream_tick := 0           # +1 per published main-thread frame
+var _streamed_tick := -1        # tick in which a camera last did the streaming work
+var _work_pending := false      # render thread: cells or lighting still to generate (editor redraw helper)
 var _baked_sun := Vector3.ZERO          # the sun direction the light volumes are (being) baked for
 var _sun_pass: Array[Vector3i] = []     # amortized sun re-bake: (cell x, cell y, version) still to do
 var _sun_pass_z := 0                    # next slice of the first entry
@@ -530,7 +550,61 @@ func _get_override(cell: Vector2i) -> StaticCloudCellOverride:
 
 ## Main-thread tick: starts and polls background loading of override textures that are given by path,
 ## for overrides within a cell of the loaded block, so they are ready by the time the cell is generated.
+## Makes the streamed block follow this camera (null = automatic: the main window's active camera).
+func set_stream_camera(cam: Camera3D) -> void:
+	stream_camera = cam
+
+
+func _find_stream_camera() -> Camera3D:
+	if is_instance_valid(stream_camera) and stream_camera.is_inside_tree():
+		return stream_camera
+	if Engine.is_editor_hint():
+		var ei = Engine.get_singleton("EditorInterface") if Engine.has_singleton("EditorInterface") else null
+		if ei != null:
+			var vp = ei.get_editor_viewport_3d(0)
+			if vp != null:
+				return vp.get_camera_3d()
+		return null
+	var tree := Engine.get_main_loop() as SceneTree
+	if tree != null and tree.root != null:
+		return tree.root.get_camera_3d()
+	return null
+
+
+func _publish_stream_camera() -> void:
+	var cam := _find_stream_camera()
+	var known := cam != null
+	var pos := cam.global_position if known else Vector3.ZERO
+	RenderingServer.call_on_render_thread(_set_stream_pos.bind(known, pos))
+	if Engine.is_editor_hint() and editor_finish_generation and _work_pending:
+		var ei = Engine.get_singleton("EditorInterface") if Engine.has_singleton("EditorInterface") else null
+		if ei != null:
+			var base = ei.get_base_control()
+			if base != null:
+				base.queue_redraw()  # any canvas change makes the editor draw a frame, 3D views included
+
+
+func _set_stream_pos(known: bool, pos: Vector3) -> void:
+	_stream_known = known
+	_stream_pos = pos
+	_stream_tick += 1
+
+
+## True when this render of the effect should drive streaming: the stream camera's first render this frame.
+## Before any camera has been published (_stream_tick == 0) every render streams, as before.
+func _is_stream_render(cam_local: Vector3) -> bool:
+	if _stream_tick == 0:
+		return true
+	if _streamed_tick == _stream_tick:
+		return false  # this frame's streaming is already done (e.g. a second view of the same camera)
+	if _stream_known and cam_local.distance_to(_stream_pos) > stream_match_distance:
+		return false  # some other camera: draw with the current block, do not move it
+	_streamed_tick = _stream_tick
+	return true
+
+
 func _main_tick() -> void:
+	_publish_stream_camera()
 	if cell_overrides.is_empty():
 		return
 	var c := _center_published
@@ -1573,7 +1647,9 @@ func _render_callback(p_callback_type: int, render_data: RenderData) -> void:
 	# whatever is missing or at the wrong resolution.
 	var cam_local: Vector3 = scene_data.get_cam_transform().origin
 	_ensure_atlases()
-	_update_streaming(cam_local)
+	var streams := _is_stream_render(cam_local)
+	if streams:
+		_update_streaming(cam_local)
 
 	var full: Vector2i = buffers.get_internal_size()
 	if full.x == 0 or full.y == 0:
@@ -1584,12 +1660,20 @@ func _render_callback(p_callback_type: int, render_data: RenderData) -> void:
 	# The uniform buffer carries the cell table, so it is uploaded before the lighting bake that reads it.
 	var ubo_bytes := _build_ubo(scene_data, full, low)
 	rd.buffer_update(_ubo, 0, ubo_bytes.size(), ubo_bytes)
-	_frame += 1
-	_process_light()
-	if amortize_sun_rebake:
-		_step_sun_pass()
-	_advance_cells()
-	_process_probe_readback()
+	if streams:
+		_frame += 1
+		_process_light()
+		if amortize_sun_rebake:
+			_step_sun_pass()
+		_advance_cells()
+		_process_probe_readback()
+		_work_pending = not _light_queue.is_empty() or not _sun_pass.is_empty() or _ready_count < _block_sorted.size()
+		if not _work_pending:
+			for cell in _block_sorted:
+				var st: CellState = _cells.get(cell)
+				if st != null and st.nxt_lv >= 0:
+					_work_pending = true
+					break
 	if not _baked_once:
 		return  # nothing to draw until the first cell has been generated
 
